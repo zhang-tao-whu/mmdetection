@@ -42,6 +42,7 @@ from .yolo_head import YOLOV3Head
 from .yolof_head import YOLOFHead
 from .yolox_head import YOLOXHead
 from .contour_head import BaseContourProposalHead, BaseContourEvolveHead
+from .lineformer_head import LineFormerHead
 
 __all__ = [
     'AnchorFreeHead', 'AnchorHead', 'GuidedAnchorHead', 'FeatureAdaption',

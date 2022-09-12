@@ -109,10 +109,14 @@ class ContourBasedInstanceSegmentor(SingleStageDetector):
         losses_contour_proposal, contour_proposals, inds = \
             self.contour_proposal_head.forward_train(x[self.contour_fpn_start_level:],
                                                        img_metas, gt_bboxes, gt_contours)
-        losses_contour_evolve = self.contour_evolve_head.forward_train(x[self.contour_fpn_start_level:],
-                                                                       img_metas, contour_proposals,
-                                                                       gt_contours, inds, key_points,
-                                                                       key_points_masks)
+        losses_contour_evolve, output_contours = \
+            self.contour_evolve_head.forward_train(x[self.contour_fpn_start_level:],
+                                                     img_metas, contour_proposals,
+                                                     gt_contours, inds, key_points,
+                                                     key_points_masks)
+
+        # output_contours: a list contains evolved contours at each evolve layer.
+        # Each has shape of (total_num_gts, 128, 2)
         losses.update(losses_contour_proposal)
         losses.update(losses_contour_evolve)
         return losses
@@ -348,3 +352,148 @@ class E2EC(ContourBasedInstanceSegmentor):
                                    contour_evolve_head, detector_fpn_start_level,
                                    contour_fpn_start_level, train_cfg,
                                    test_cfg, pretrained, init_cfg)
+
+
+@DETECTORS.register_module()
+class LineFormer(ContourBasedInstanceSegmentor):
+    """Implementation of `LineFormer'."""
+
+    def __init__(self,
+                 backbone,
+                 neck=None,
+                 bbox_head=None,
+                 contour_proposal_head=None,
+                 contour_evolve_head=None,
+                 line_pred_head=None,
+                 detector_fpn_start_level=1,
+                 contour_fpn_start_level=1,
+                 line_pred_start_level=1,
+                 train_cfg=None,
+                 test_cfg=None,
+                 pretrained=None,
+                 init_cfg=None):
+        super(LineFormer, self).__init__(backbone, neck, bbox_head, contour_proposal_head,
+                                   contour_evolve_head, detector_fpn_start_level,
+                                   contour_fpn_start_level, train_cfg,
+                                   test_cfg, pretrained, init_cfg)
+
+        self.line_pred_head = build_head(line_pred_head)
+        self.line_pred_start_level = line_pred_start_level
+
+    def forward_train(self,
+                      img,
+                      img_metas,
+                      gt_bboxes,
+                      gt_labels,
+                      gt_polys,
+                      gt_lines,
+                      num_lines,
+                      gt_masks=None,
+                      key_points=None,
+                      key_points_masks=None,
+                      gt_bboxes_ignore=None):
+        """
+        Args:
+            img (Tensor): Input images of shape (N, C, H, W).
+                Typically these should be mean centered and std scaled.
+            img_metas (list[dict]): A List of image info dict where each dict
+                has: 'img_shape', 'scale_factor', 'flip', and may also contain
+                'filename', 'ori_shape', 'pad_shape', and 'img_norm_cfg'.
+                For details on the values of these keys see
+                :class:`mmdet.datasets.pipelines.Collect`.
+            gt_bboxes (list[Tensor]): Each item are the truth boxes for each
+                image in [tl_x, tl_y, br_x, br_y] format.
+            gt_lines (list[Tensor]): Each has shape of [num_total_lines, 4].
+            num_lines (list[Tensor]): Indicating how many lines does a instance has.
+                Shape [ngt, ]
+            gt_labels (list[Tensor]): Class indices corresponding to each box
+            gt_bboxes_ignore (None | list[Tensor]): Specify which bounding
+                boxes can be ignored when computing the loss.
+
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        super(SingleStageDetector, self).forward_train(img, img_metas)
+        gt_contours = gt_polys
+        x = self.extract_feat(img)
+        losses = self.bbox_head.forward_train(x[self.detector_fpn_start_level:], img_metas, gt_bboxes,
+                                              gt_labels, gt_bboxes_ignore)
+        losses_contour_proposal, contour_proposals, inds = \
+            self.contour_proposal_head.forward_train(x[self.contour_fpn_start_level:],
+                                                     img_metas, gt_bboxes, gt_contours)
+        losses_contour_evolve, output_contours = \
+            self.contour_evolve_head.forward_train(x[self.contour_fpn_start_level:],
+                                                   img_metas, contour_proposals,
+                                                   gt_contours, inds, key_points,
+                                                   key_points_masks)
+        gt_lines_list = []
+        for i in range(len(num_lines)):
+            instance_end_index = num_lines[i].cumsum(0)
+            lines = torch.tensor_split(gt_lines[i], instance_end_index.cpu(), dim=0)
+            lines = list(lines)[:-1]
+            gt_lines_list = gt_lines_list + lines
+        losses_line = self.line_pred_head.forward_train(x[self.line_pred_start_level:],
+                                                        img_metas, output_contours[-1],
+                                                        gt_bboxes, inds, gt_lines_list)
+        losses.update(losses_contour_proposal)
+        losses.update(losses_contour_evolve)
+        losses.update(losses_line)
+        return losses
+
+    def simple_test(self, img, img_metas, rescale=False, print_consumed_time=False):
+        """Test function without test-time augmentation.
+
+        Args:
+            img (torch.Tensor): Images with shape (N, C, H, W).
+            img_metas (list[dict]): List of image information.
+            rescale (bool, optional): Whether to rescale the results.
+                Defaults to False.
+
+        Returns:
+            list[list[np.ndarray]]: BBox results of each image and classes.
+                The outer list corresponds to each image. The inner list
+                corresponds to each class.
+        """
+        now_time = time.time()
+        time_dict = {}
+        feat = self.extract_feat(img)
+        time_dict['backbone'] = now_time - time.time()
+        now_time = time.time()
+        results_list = self.bbox_head.simple_test(
+            feat[self.detector_fpn_start_level:], img_metas, rescale=rescale)
+        time_dict['detector'] = now_time - time.time()
+        now_time = time.time()
+        # results_list [(bboxes, labels), ...]
+        # boxes (Tensor): Bboxes with score after nms, has shape (num_bboxes, 5). last dimension 5 arrange as (x1, y1, x2, y2, score)
+        # labels (Tensor): has shape (num_bboxes, )
+        bboxes_pred = [item[0] for item in results_list]
+        labels_pred = [item[1] for item in results_list]
+        contour_proposals, inds = self.contour_proposal_head.simple_test(feat[self.contour_fpn_start_level:], img_metas,
+                                                                         bboxes_pred)
+        time_dict['contour_proposal'] = now_time - time.time()
+        now_time = time.time()
+        contours_pred = self.contour_evolve_head.simple_test(feat[self.contour_fpn_start_level:], img_metas,
+                                                             contour_proposals, inds)
+        time_dict['contour_evolve'] = now_time - time.time()
+        now_time = time.time()
+        mask_results = self.convert_contour2mask(contours_pred, labels_pred, bboxes_pred, img_metas)
+        bboxes_pred = [item[1] for item in mask_results]
+        labels_pred = [item[2] for item in mask_results]
+        mask_results = [item[0] for item in mask_results]
+        time_dict['post_contour2mask'] = now_time - time.time()
+        now_time = time.time()
+        results_list = list(zip(bboxes_pred, labels_pred))
+        bbox_results = [
+            bbox2result(det_bboxes, det_labels, self.bbox_head.num_classes)
+            for det_bboxes, det_labels in results_list
+        ]
+        whole_time = 0
+        for key in time_dict.keys():
+            whole_time += time_dict[key]
+        time_dict['whole'] = whole_time
+        for key in time_dict.keys():
+            time_dict[key] /= time_dict['whole']
+        if print_consumed_time:
+            print(' ')
+            print(time_dict)
+        return list(zip(bbox_results, mask_results))

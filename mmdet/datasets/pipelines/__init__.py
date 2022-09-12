@@ -16,6 +16,7 @@ from .transforms import (Albu, CutOut, Expand, MinIoURandomCrop, MixUp, Mosaic,
                          RandomCenterCropPad, RandomCrop, RandomFlip,
                          RandomShift, Resize, SegRescale, YOLOXHSVRandomAug,
                          AlignSampleBoundary)
+from .custom_pipelines import AlignSampleBoundaryLine, ContourLineDefaultFormatBundle
 
 __all__ = [
     'Compose', 'to_tensor', 'ToTensor', 'ImageToTensor', 'ToDataContainer',
